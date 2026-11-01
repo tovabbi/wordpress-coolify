@@ -106,7 +106,8 @@ services:
       start_period: 15s
 
   wordpress:
-    image: wordpress:6-php8.3-fpm
+    # Latest WordPress release, PHP pinned to 8.3 (use "wordpress:fpm" to float PHP too)
+    image: wordpress:php8.3-fpm
     restart: unless-stopped
     depends_on:
       mysql:
