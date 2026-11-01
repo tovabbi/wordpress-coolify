@@ -1,0 +1,210 @@
+# WordPress (PHP-FPM) + Nginx + MySQL for Coolify (Docker Compose build pack)
+# All images are multi-arch, so this runs on the Oracle Ampere ARM server.
+#
+# Coolify magic variables used:
+#   SERVICE_FQDN_NGINX_80      -> domain + proxy routing to port 80 of the "nginx" service
+#   SERVICE_PASSWORD_MYSQL     -> generated DB password for the wordpress user
+#   SERVICE_PASSWORD_MYSQLROOT -> generated MySQL root password
+#
+# Put your domain on the "nginx" service in the Coolify UI (not on "wordpress").
+
+services:
+  nginx:
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    depends_on:
+      - wordpress
+    environment:
+      - SERVICE_FQDN_NGINX_80
+      - TZ=Europe/Budapest
+    volumes:
+      # Same volume as PHP-FPM, read-only: nginx serves static files directly
+      - wordpress-files:/var/www/html:ro
+    # The config is written at start-up from here. "$$" becomes "$" when compose
+    # reads the file, so nginx variables like $uri survive intact.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat > /etc/nginx/conf.d/default.conf <<'NGINXCONF'
+        map $$http_x_forwarded_proto $$fcgi_https {
+            default off;
+            https   on;
+        }
+
+        server {
+            listen 80;
+            server_name _;
+            root /var/www/html;
+            index index.php;
+
+            # Must match (or be below) PHP's upload_max_filesize / post_max_size
+            client_max_body_size 256M;
+            client_body_timeout 300s;
+
+            server_tokens off;
+
+            gzip on;
+            gzip_comp_level 5;
+            gzip_min_length 256;
+            gzip_vary on;
+            gzip_types text/plain text/css text/xml application/json application/javascript application/xml application/rss+xml image/svg+xml font/ttf font/otf;
+
+            # Re-resolve the PHP container via Docker DNS, so a recreated
+            # "wordpress" container does not cause 502s until nginx restarts
+            resolver 127.0.0.11 valid=10s;
+            set $$fpm wordpress:9000;
+
+            # Answers instantly without touching PHP or MySQL (used by the healthcheck)
+            location = /nginx-health { access_log off; default_type text/plain; return 200 "ok"; }
+
+            location = /favicon.ico { log_not_found off; access_log off; }
+            location = /robots.txt  { log_not_found off; access_log off; try_files $$uri /index.php?$$args; }
+
+            location / {
+                try_files $$uri $$uri/ /index.php?$$args;
+            }
+
+            location ~ \.php$ {
+                try_files $$uri =404;
+                include fastcgi_params;
+                fastcgi_pass $$fpm;
+                fastcgi_index index.php;
+                fastcgi_param SCRIPT_FILENAME $$document_root$$fastcgi_script_name;
+                fastcgi_param HTTPS $$fcgi_https;
+                fastcgi_intercept_errors on;
+                fastcgi_buffer_size 32k;
+                fastcgi_buffers 16 16k;
+                fastcgi_read_timeout 300s;
+                fastcgi_send_timeout 300s;
+            }
+
+            # Long cache for static assets
+            location ~* \.(css|js|jpg|jpeg|png|gif|webp|avif|ico|svg|woff|woff2|ttf|eot|mp4|webm)$ {
+                expires 30d;
+                add_header Cache-Control "public";
+                access_log off;
+                log_not_found off;
+            }
+
+            # Never execute PHP from uploads
+            location ~* /(?:uploads|files)/.*\.php$ { deny all; }
+
+            # Block dotfiles (keep .well-known for Let's Encrypt etc.)
+            location ~ /\.(?!well-known) { deny all; }
+
+            # Uncomment if you do not use Jetpack / the WordPress mobile app:
+            # location = /xmlrpc.php { deny all; }
+        }
+        NGINXCONF
+        exec nginx -g 'daemon off;'
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/nginx-health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  wordpress:
+    image: wordpress:6-php8.3-fpm
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      - TZ=Europe/Budapest
+      - WORDPRESS_DB_HOST=mysql
+      - WORDPRESS_DB_NAME=wordpress
+      - WORDPRESS_DB_USER=wordpress
+      - WORDPRESS_DB_PASSWORD=${SERVICE_PASSWORD_MYSQL}
+      - WORDPRESS_TABLE_PREFIX=wp_
+      - WORDPRESS_DEBUG=0
+      # NOTE: every "$" is written as "$$" so compose does not try to interpolate it.
+      - |
+        WORDPRESS_CONFIG_EXTRA=
+        if (isset($$_SERVER['HTTP_X_FORWARDED_PROTO']) && $$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') { $$_SERVER['HTTPS'] = 'on'; }
+        define('WP_MEMORY_LIMIT', '256M');
+        define('WP_MAX_MEMORY_LIMIT', '512M');
+        define('FS_METHOD', 'direct');
+        define('DISALLOW_FILE_EDIT', true);
+        define('WP_POST_REVISIONS', 5);
+        define('EMPTY_TRASH_DAYS', 14);
+        define('WP_AUTO_UPDATE_CORE', 'minor');
+        define('DISABLE_WP_CRON', true);
+    volumes:
+      # Whole web root, so wp-config.php, salts, plugins, uploads all persist
+      - wordpress-files:/var/www/html
+      # PHP settings (fixes "uploaded file exceeds upload_max_filesize")
+      - type: bind
+        source: ./php-custom.ini
+        target: /usr/local/etc/php/conf.d/zz-custom.ini
+        content: |
+          upload_max_filesize = 256M
+          post_max_size = 256M
+          memory_limit = 512M
+          max_execution_time = 300
+          max_input_time = 300
+          max_input_vars = 5000
+          max_file_uploads = 50
+          date.timezone = Europe/Budapest
+          expose_php = Off
+          opcache.enable = 1
+          opcache.memory_consumption = 128
+          opcache.max_accelerated_files = 10000
+          opcache.validate_timestamps = 1
+          opcache.revalidate_freq = 60
+      # PHP-FPM process pool (lower pm.max_children on a small server)
+      - type: bind
+        source: ./fpm-custom.conf
+        target: /usr/local/etc/php-fpm.d/zz-custom.conf
+        content: |
+          [www]
+          pm = dynamic
+          pm.max_children = 12
+          pm.start_servers = 3
+          pm.min_spare_servers = 2
+          pm.max_spare_servers = 6
+          pm.max_requests = 500
+          request_terminate_timeout = 300s
+
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Budapest
+      - MYSQL_DATABASE=wordpress
+      - MYSQL_USER=wordpress
+      - MYSQL_PASSWORD=${SERVICE_PASSWORD_MYSQL}
+      - MYSQL_ROOT_PASSWORD=${SERVICE_PASSWORD_MYSQLROOT}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --max_allowed_packet=64M
+      - --innodb_buffer_pool_size=256M
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Replaces WP-Cron's "run on page visit" with a real 5-minute timer.
+  # Keeps scheduled posts and abandoned-cart emails on time on quiet sites.
+  wp-cron:
+    image: curlimages/curl:latest
+    restart: unless-stopped
+    depends_on:
+      - nginx
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          sleep 300
+          curl -fsS -o /dev/null http://nginx/wp-cron.php || true
+        done
+
+volumes:
+  wordpress-files:
+  mysql-data:
